@@ -1,9 +1,8 @@
 #!/bin/bash
 
-set -e
+set -e pipefail
 
-
-# Set this to default to a KNOWN GOOD pi firmware (e.g. 1.20200811); this is used if RASPBERRY_PI_FIRMWARE env variable is not specified
+# Set this to default to a KNOWN GOOD pi firmware (e.g. 1.20200811 or 1.20200819); this is used if RASPBERRY_PI_FIRMWARE env variable is not specified
 DEFAULT_GOOD_PI_VERSION="1.20200811"
 
 # Set this to default to a KNOWN GOOD k3os (e.g. v0.11.0); this is used if K3OS_VERSION env variable is not specified
@@ -71,33 +70,7 @@ assert_tool 7z
 assert_tool dd
 assert_tool jq
 
-## Check if we are building a supported image
-IMAGE_TYPE=$1
-
-if [ -z "$IMAGE_TYPE" -o "$IMAGE_TYPE" = "help" -o "$IMAGE_TYPE" = "--help" -o "$IMAGE_TYPE" = "-h" ]; then
-	echo "Usage: $0 <image type>" >&2
-	echo "Supported image types:" >&2
-	echo "  raspberrypi - Raspberry Pi model 3B+/4." >&2
-	echo "  orangepipc2 - Orange Pi PC 2" >&2
-	echo "  all         - Calls itself once for each supported image type" >&2
-	exit 1
-elif [ "$IMAGE_TYPE" = "raspberrypi" ]; then
-	echo "Building an image for the Raspberry Pi model 3B+/4."
-elif [ "$IMAGE_TYPE" = "orangepipc2" ]; then
-	echo "Building an image for the Orange Pi PC 2."
-elif [ "$IMAGE_TYPE" = "all" ]; then
-	$0 "raspberrypi"
-	$0 "orangepipc2"
-	exit 0
-else
-	echo "Unsupported image type \"$IMAGE_TYPE\". See \"$0 help\" for more information." >&2
-	exit 1
-fi
-
-if [ "$IMAGE_TYPE" = "orangepipc2" ]; then
-	# mkimage is in u-boot-tools
-	assert_tool mkimage
-fi
+echo "Building an image for the Raspberry Pi model 3B+/4."
 
 ## Download dependencies
 echo "== Checking or downloading dependencies... =="
@@ -110,24 +83,7 @@ function dl_dep() {
 
 mkdir -p deps
 
-if [ "$IMAGE_TYPE" = "raspberrypi" ]; then
-	get_pifirmware
-elif [ "$IMAGE_TYPE" = "orangepipc2" ]; then
-	# TODO: apt.armbian.com removes old versions, so these URLs become
-	# outdated. Find an armbian mirror that keeps old versions so that
-	# the URLs remain functional.
-	dl_dep linux-dtb-dev-sunxi64.deb https://apt.armbian.com/pool/main/l/linux-5.4.2-sunxi64/linux-dtb-dev-sunxi64_19.11.3.348_arm64.deb
-	dl_dep linux-image-dev-sunxi64.deb https://apt.armbian.com/pool/main/l/linux-5.4.2-sunxi64/linux-image-dev-sunxi64_19.11.3.348_arm64.deb
-
-	if [ ! -f "deps/armbian_orangepipc2.img" ]; then
-		pushd deps
-		wget -O Armbian_orangepipc2_buster_current.7z https://dl.armbian.com/orangepipc2/archive/Armbian_19.11.3_Orangepipc2_buster_current_5.3.9.7z
-		7z x Armbian_orangepipc2_buster_current.7z \*.img
-		dd of=armbian_orangepipc2.img bs=1024 count=4096 < Armbian_*_Orangepipc2_buster_current_*.img
-		rm Armbian_*_Orangepipc2_buster_current_*.img Armbian_orangepipc2_buster_current.7z
-		popd
-	fi
-fi
+get_pifirmware
 
 if [ -z "${K3OS_VERSION}" ]; then
     echo "K3OS_VERSION env variable was not set - defaulting to known version [${DEFAULT_GOOD_K3OS_VERSION}]"
@@ -165,50 +121,45 @@ dl_dep rpi-firmware-nonfree-master.zip https://github.com/RPi-Distro/firmware-no
 echo "== Making image and filesystems... =="
 IMAGE=$(mktemp picl-k3os-build.iso.XXXXXX)
 
-if [ "$IMAGE_TYPE" = "raspberrypi" ]; then
-	# Create two partitions: boot and root.
-	BOOT_CAPACITY=60
-	# Initial root size. The partition will be resized to the SD card's maximum on first boot.
-	ROOT_CAPACITY=1000
-	IMAGE_SIZE=$(($BOOT_CAPACITY + $ROOT_CAPACITY))
+# Create two partitions: boot and root.
+BOOT_CAPACITY=60
+# Initial root size. The partition will be resized to the SD card's maximum on first boot.
+ROOT_CAPACITY=1000
+IMAGE_SIZE=$(($BOOT_CAPACITY + $ROOT_CAPACITY))
 
-	truncate -s ${IMAGE_SIZE}M $IMAGE
-	parted -s $IMAGE mklabel msdos
-	parted -s $IMAGE unit MB mkpart primary fat32 1 $BOOT_CAPACITY
-	parted -s $IMAGE unit MB mkpart primary $(($BOOT_CAPACITY+1)) $IMAGE_SIZE
-	parted -s $IMAGE set 1 boot on
-elif [ "$IMAGE_TYPE" = "orangepipc2" ]; then
-	# Create a single partition; bootloader is copied from armbian
-	# at specific locations before the first partition. The partition
-	# will be resized to the SD card's maximum on first boot.
-	truncate -s 600M $IMAGE
-	parted -s $IMAGE mklabel msdos
-	parted -s $IMAGE unit s mkpart primary 8192 100%
+truncate -s ${IMAGE_SIZE}M $IMAGE
+parted -s $IMAGE mklabel msdos
+parted -s $IMAGE unit MB mkpart primary fat32 1 $BOOT_CAPACITY
+parted -s $IMAGE unit MB mkpart primary $(($BOOT_CAPACITY+1)) $IMAGE_SIZE
+parted -s $IMAGE set 1 boot on
 
-	# copy everything before the first partition, except the partition table
-	dd if=deps/armbian_orangepipc2.img of=$IMAGE bs=512 skip=1 seek=1 count=8191 conv=notrunc
-fi
+LOOPDEV=$(losetup --find --show --partscan ${IMAGE})
 
-LODEV=`sudo losetup --show -f $IMAGE`
-sudo partprobe -s $LODEV
+# drop the first line, as this is our LOOPDEV itself, but we only want the child partitions
+PARTITIONS=$(lsblk --raw --output "MAJ:MIN" --noheadings ${LOOPDEV} | tail -n +2)
+COUNTER=1
+for i in $PARTITIONS; do
+    MAJ=$(echo $i | cut -d: -f1)
+    MIN=$(echo $i | cut -d: -f2)
+    if [ ! -e "${LOOPDEV}p${COUNTER}" ]; then mknod ${LOOPDEV}p${COUNTER} b $MAJ $MIN; fi
+    COUNTER=$((COUNTER + 1))
+done
+
+sudo partprobe -s $LOOPDEV
 sleep 1
 
-if [ "$IMAGE_TYPE" = "raspberrypi" ]; then
-	LODEV_BOOT=${LODEV}p1
-	LODEV_ROOT=${LODEV}p2
-	sudo mkfs.fat $LODEV_BOOT
-elif [ "$IMAGE_TYPE" = "orangepipc2" ]; then
-	LODEV_ROOT=${LODEV}p1
-fi
+LOOPDEV_BOOT=${LOOPDEV}p1
+LOOPDEV_ROOT=${LOOPDEV}p2
+sudo mkfs.fat $LOOPDEV_BOOT
 
-sudo mkfs.ext4 -F $LODEV_ROOT
-sudo tune2fs -i 1m $LODEV_ROOT
-sudo e2label $LODEV_ROOT "root"
+sudo mkfs.ext4 -F $LOOPDEV_ROOT
+sudo tune2fs -i 1m $LOOPDEV_ROOT
+sudo e2label $LOOPDEV_ROOT "root"
 
 ## Initialize root
 echo "== Initializing root... =="
 mkdir root
-sudo mount $LODEV_ROOT root
+sudo mount $LOOPDEV_ROOT root
 sudo mkdir root/bin root/boot root/dev root/etc root/home root/lib root/media
 sudo mkdir root/mnt root/opt root/proc root/root root/sbin root/sys
 sudo mkdir root/tmp root/usr root/var
@@ -220,44 +171,47 @@ sudo mknod -m 0666 root/dev/null c 1 3
 
 ## Initialize boot
 echo "== Initializing boot... =="
-if [ "$IMAGE_TYPE" = "raspberrypi" ]; then
-	PITEMP="$(mktemp -d)"
-	sudo tar -xf deps/raspberrypi-firmware.tar.gz --strip 1 -C $PITEMP
 
-	mkdir boot
-	sudo mount $LODEV_BOOT boot
-	sudo cp -R $PITEMP/boot/* boot
-	sudo cp -R $PITEMP/modules root/lib
+PITEMP="$(mktemp -d)"
+sudo tar -xf deps/raspberrypi-firmware.tar.gz --strip 1 -C $PITEMP
 
-	cat <<EOF | sudo tee boot/config.txt >/dev/null
+mkdir boot
+sudo mount $LOOPDEV_BOOT boot
+sudo cp -R $PITEMP/boot/* boot
+sudo cp -R $PITEMP/modules root/lib
+
+cat <<EOF | sudo tee boot/config.txt >/dev/null
 dtoverlay=vc4-fkms-v3d
-gpu_mem=128
+gpu_mem=16
 arm_64bit=1
 
-[pi3]
-audio_pwm_mode=2
-[pi4]
-max_framebuffers=2
-kernel=kernel8.img
-[all]
+boot_delay=1
+disable_splash=1
+
+dtparam=sd_overclock=99
+dtparam=audio=off
+
+over_voltage=2
+
+arm_freq=1400
+core_freq=450
+sdram_freq=520
+sdram_schmoo=0x00000000
+
+temp_limit=80
+initial_turbo=0
 EOF
-	PARTUUID=$(sudo blkid -o export $LODEV_ROOT | grep PARTUUID)
-	echo "dwc_otg.lpm_enable=0 root=$PARTUUID rootfstype=ext4 elevator=deadline cgroup_memory=1 cgroup_enable=memory rootwait init=/sbin/init.resizefs ro" | sudo tee boot/cmdline.txt >/dev/null
-	sudo rm -rf $PITEMP
-elif [ "$IMAGE_TYPE" = "orangepipc2" ]; then
-	cat <<EOF | sudo tee root/boot/env.txt >/dev/null
-extraargs=elevator=deadline rootwait init=/sbin/init.resizefs ro
-EOF
-	sudo install -m 0644 -o root -g root orangepipc2-boot.cmd root/boot/boot.cmd
-	sudo mkimage -C none -A arm -T script -d root/boot/boot.cmd root/boot/boot.scr
-fi
+
+PARTUUID=$(sudo blkid -o export $LOOPDEV_ROOT | grep PARTUUID)
+echo "dwc_otg.lpm_enable=0 root=$PARTUUID rootfstype=ext4 elevator=deadline cgroup_memory=1 cgroup_enable=memory rootwait init=/sbin/init.resizefs ro" | sudo tee boot/cmdline.txt >/dev/null
+sudo rm -rf $PITEMP
 
 ## Install k3os, busybox and resize dependencies
-echo "== Installing... =="
+echo "== Unpacking rootfs =="
 sudo tar -xf deps/k3os-rootfs-arm64.tar.gz --strip 1 -C root
 # config.yaml will be created by init.resizefs based on MAC of eth0
 sudo cp -R config root/k3os/system
-for filename in root/k3os/system/config/*.*; do [ "$filename" != "${filename,,}" ] && sudo mv "$filename" "${filename,,}" ; done 
+for filename in root/k3os/system/config/*.*; do [ "$filename" != "${filename,,}" ] && sudo mv "$filename" "${filename,,}" ; done
 K3OS_VERSION=$(ls --indicator-style=none root/k3os/system/k3os | grep -v current | head -n1)
 
 ## Install busybox
@@ -309,19 +263,12 @@ for i in \
 	sudo ln -s busybox root/bin/$i
 done
 
-if [ "$IMAGE_TYPE" = "orangepipc2" ]; then
-	unpack_deb "linux-dtb-dev-sunxi64.deb" "root"
-	sudo ln -s $(cd root/boot; ls -d dtb-*-sunxi64 | head -n1) root/boot/dtb
-	unpack_deb "linux-image-dev-sunxi64.deb" "root"
-	sudo ln -s $(cd root/boot; ls -d vmlinuz-*-sunxi64 | head -n1) root/boot/Image
-elif [ "$IMAGE_TYPE" = "raspberrypi" ]; then
-  BRCMTMP=$(mktemp -d)
-  7z e -y deps/rpi-firmware-nonfree-master.zip -o"$BRCMTMP" "firmware-nonfree-master/brcm/*" > /dev/null
-  sudo mkdir -p root/lib/firmware/brcm/
-  sudo cp "$BRCMTMP"/brcmfmac43455* root/lib/firmware/brcm/
-  sudo cp "$BRCMTMP"/brcmfmac43430* root/lib/firmware/brcm/
-  rm -rf "$BRCMTMP"
-fi
+BRCMTMP=$(mktemp -d)
+7z e -y deps/rpi-firmware-nonfree-master.zip -o"$BRCMTMP" "firmware-nonfree-master/brcm/*" > /dev/null
+sudo mkdir -p root/lib/firmware/brcm/
+sudo cp "$BRCMTMP"/brcmfmac43455* root/lib/firmware/brcm/
+sudo cp "$BRCMTMP"/brcmfmac43430* root/lib/firmware/brcm/
+rm -rf "$BRCMTMP"
 
 ## Add libraries and binaries needed to resize root FS & fsck every boot
 unpack_deb "libcom-err2-arm64.deb" "root"
@@ -348,21 +295,18 @@ sudo rm -rf root-resize
 
 ## Write a resizing init and a pre-init
 sudo install -m 0755 -o root -g root init.preinit init.resizefs root/sbin
-sudo sed -i "s#@IMAGE_TYPE@#$IMAGE_TYPE#" root/sbin/init.resizefs root/sbin/init.preinit
 
 ## Clean up
 sync
-if [ "$IMAGE_TYPE" = "raspberrypi" ]; then
-	sudo umount boot
-	rmdir boot
-fi
+sudo umount boot
+rmdir boot
 sudo umount root
 rmdir root
 sync
 sleep 1
-sudo losetup -d $LODEV
+sudo losetup -d $LOOPDEV
 
-IMAGE_FINAL=out/picl-k3os-${K3OS_VERSION}-${IMAGE_TYPE}.img
+IMAGE_FINAL=out/picl-k3os-${K3OS_VERSION}-rpi3bplus.img
 mv $IMAGE $IMAGE_FINAL
 echo ""
 echo "== $IMAGE_FINAL created. =="

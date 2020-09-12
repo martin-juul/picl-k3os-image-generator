@@ -1,11 +1,11 @@
 # PiCl k3os image generator
 
-This project can be used to generate images for k3os compatible with various armv8 (aarch64) devices:
+This project can be used to generate images for k3os compatible with aarch64 Raspberry Pis:
 
 - Raspberry Pi model 3B+
 - Raspberry Pi model 4
-- Orange Pi PC 2
-- (Other devices may be compatible as well. PRs welcome! Please file an issue if you need any help with porting.)
+- ~~Orange Pi PC 2~~
+- ~~(Other devices may be compatible as well. PRs welcome! Please file an issue if you need any help with porting.)~~
 
 ## Getting Started
 
@@ -60,14 +60,21 @@ building on a Mac.
 
 Run the container using:
 
+```bash
+docker build -t picl-k3os-image-generator .
+docker run -e TARGET=raspberrypi -v $PWD/config:/app/config -v $PWD/deps:/app/deps -v $PWD/out:/app/out -v /dev:/dev --privileged picl-k3os-image-generator:latest
 ```
-docker run -e TARGET=raspberrypi -v $PWD/config:/app/config -v $PWD/deps:/app/deps -v $PWD/out:/app/out -v /dev:/dev --privileged elmariofredo/picl-k3os-image-generator:v0.2
-```
 
-The images will be written into your local directory once the container is done.
+The images will be written into `/out`
 
-## Authors & License
+## Flashing
 
-This code was written by Dennis Brentjes and Sjors Gielen. Contributions welcome!
+The image cannot be flashed with balena-etcher. You must use dd.
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+### From macOS
+
+1. Ensure you have coreutils installed
+    * `brew install coreutils`
+2. Insert microSD card
+3. Unmount it `diskutil unmountDisk /dev/disk2`
+4. `sudo gdd bs=8192 status=progress if=out/picl-k3os-v0.11.0-rpi3bplus.img of=/dev/rdisk2`
